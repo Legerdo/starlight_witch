@@ -1,0 +1,1135 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Starlight Witch — 16-bit Spell Cast Loop</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #06050d; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas {
+    display: block;
+    image-rendering: crisp-edges;
+    image-rendering: pixelated;
+  }
+</style>
+</head>
+<body>
+<canvas id="screen" role="img" aria-label="밤하늘 아래 폐허에서 별빛 마법을 시전하는 분홍 트윈테일 마녀 소녀의 픽셀 아트 애니메이션"></canvas>
+<script>
+'use strict';
+(() => {
+// =====================================================================
+//  CONSTANTS
+// =====================================================================
+const W = 128, H = 96;          // logical resolution (never changes)
+const L = 360;                  // loop length in 60Hz ticks (6 s)
+const Q = 5;                    // sprite pose quantization: 60/5 = 12 fps
+const TAU = Math.PI * 2;
+const CX = 30, GY = 83;         // witch root (between the feet) in world px
+const IX = 100, IY = 60;        // spell impact point (pillar face)
+const HS0 = 220, HS1 = 228;     // hit-stop window (ticks)
+const MG = 2;                   // static layer margin for screen shake
+const RM = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+// =====================================================================
+//  PALETTE — 26 fixed colors
+// =====================================================================
+const HEX = [
+  '#0b0a1f', '#16163a', '#262659',             //  0- 2 night sky deep / mid / horizon
+  '#2b2945', '#433f66', '#66608c',             //  3- 5 stone dark / mid / light
+  '#120b1c',                                   //  6    outline
+  '#4d1c4a', '#9a3a78', '#e0709f', '#ffb4d2',  //  7-10 hair outline / dark / base / highlight
+  '#e0968a', '#fcd9c0',                        // 11-12 skin shadow / skin
+  '#262c68', '#3c4aa6', '#6f86e0',             // 13-15 cloth shadow / base / highlight
+  '#a19ec8', '#eeecf8',                        // 16-17 white cloth shadow / base
+  '#b5732a', '#ffd56a',                        // 18-19 gold dark / gold
+  '#d0344f',                                   // 20    ribbon red
+  '#1c3f86', '#2d86d8', '#52dcf4', '#b8f7ff',  // 21-24 magic: dissipating → mid → saturated → pale
+  '#ffffff'                                    // 25    white-hot impact
+];
+const BG0 = 0, BG1 = 1, BG2 = 2, ST0 = 3, ST1 = 4, ST2 = 5, OUT = 6,
+      HO = 7, HD = 8, HB = 9, HL = 10, SS = 11, SK = 12,
+      CS = 13, CB = 14, CH = 15, WS = 16, WH = 17, GD = 18, GL = 19, RD = 20,
+      M0 = 21, M1 = 22, M2 = 23, M3 = 24, HOT = 25;
+
+const LITTLE = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+const PAL = new Uint32Array(HEX.length);
+for (let i = 0; i < HEX.length; i++) {
+  const v = parseInt(HEX[i].slice(1), 16), r = (v >> 16) & 255, g = (v >> 8) & 255, b = v & 255;
+  PAL[i] = LITTLE ? ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0 : ((r << 24) | (g << 16) | (b << 8) | 255) >>> 0;
+}
+
+// color remap tables
+function lut(pairs) {
+  const a = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) a[i] = i;
+  for (let i = 0; i < pairs.length; i += 2) a[pairs[i]] = pairs[i + 1];
+  return a;
+}
+const OUTL = new Uint8Array(32).fill(OUT);               // selective outline per material
+OUTL[HD] = OUTL[HB] = OUTL[HL] = OUTL[SS] = OUTL[SK] = HO;
+OUTL[M1] = OUTL[M2] = OUTL[M3] = OUTL[HOT] = M0;
+const RIMS = lut([HD, M3, HB, M3, HL, M3, SS, M3, SK, M3, CS, M2, CB, M2, CH, M3, WS, HOT, WH, HOT, GD, GL, GL, HOT, RD, M3]);
+const RIMW = lut([HD, HB, HB, HL, HL, WH, SS, SK, SK, WH, CS, CB, CB, CH, CH, M2, WS, WH, GD, GL, RD, HL]);
+const LIT1 = lut([ST0, ST1, ST1, ST2, ST2, WS]);
+const LIT2 = lut([ST0, M0, ST1, M1, ST2, M2, WS, M3, BG0, ST0]);
+const DARK = lut([ST1, ST0, ST2, ST1, ST0, BG1, WS, ST2]);
+const TINT = lut([BG0, BG1, BG1, BG2, BG2, M0, ST0, ST1, ST1, ST2, ST2, WS]);
+const BOOTD = lut([WH, WS, CB, CS, CH, CB]);
+
+const BAY = new Float32Array([0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]);
+for (let i = 0; i < 16; i++) BAY[i] = (BAY[i] + 0.5) / 16;
+const bay = (x, y) => BAY[((y & 3) << 2) | (x & 3)];
+
+// deterministic RNG (mulberry32)
+let rs = 1;
+function rnd() {
+  rs = (rs + 0x6D2B79F5) | 0;
+  let t = Math.imul(rs ^ (rs >>> 15), 1 | rs);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const rr = (a, b) => a + rnd() * (b - a);
+const RUN_SEED = 0x51A7;
+
+// =====================================================================
+//  BUFFERS
+// =====================================================================
+const buf = new Uint8Array(W * H);        // final indexed frame
+const cb = new Uint8Array(W * H);         // character layer (0 = empty)
+const cf = new Uint8Array(W * H);         // char flags: 1 outline, 2 no-rim, 4 rimmed
+const pb = new Uint8Array(W * H);         // scratch for one sprite part
+const BW = W + MG * 2, BH = H + MG * 2;
+const bgS = new Uint8Array(BW * BH);      // static background (with shake margin)
+const fgS = new Uint8Array(BW * BH);      // static foreground silhouettes (0 = clear)
+let camX = 0, camY = 0;
+let pbx0 = W, pby0 = H, pbx1 = -1, pby1 = -1;
+
+const R = Math.round;
+function px(x, y, c) {                    // world pixel → frame (with camera)
+  x = R(x) + camX; y = R(y) + camY;
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  buf[y * W + x] = c;
+}
+function pp(x, y, c) {                    // world pixel → part scratch
+  x = R(x); y = R(y);
+  if (x < 1 || y < 1 || x >= W - 1 || y >= H - 1) return;
+  pb[y * W + x] = c;
+  if (x < pbx0) pbx0 = x; if (x > pbx1) pbx1 = x;
+  if (y < pby0) pby0 = y; if (y > pby1) pby1 = y;
+}
+function bs(x, y, c) { if (x < -MG || y < -MG || x >= W + MG || y >= H + MG) return; bgS[(y + MG) * BW + x + MG] = c; }
+function fs(x, y, c) { if (x < -MG || y < -MG || x >= W + MG || y >= H + MG) return; fgS[(y + MG) * BW + x + MG] = c; }
+
+// =====================================================================
+//  HAND-PIXELED TEMPLATES
+// =====================================================================
+const CM = { '.': 0, H: HB, L: HL, D: HD, O: HO, S: SK, s: SS, E: OUT, I: M1, W: WH, w: WS,
+             p: HL, B: CB, b: CS, h: CH, R: RD, G: GL, g: GD };
+function tpl(rows) {
+  const h = rows.length, w = rows[0].length, d = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) d[y * w + x] = CM[rows[y][x]] || 0;
+  return { w, h, d };
+}
+function stamp(t, x0, y0, map) {
+  for (let y = 0; y < t.h; y++) for (let x = 0; x < t.w; x++) {
+    const c = t.d[y * t.w + x];
+    if (c) pp(x0 + x, y0 + y, map ? map[c] : c);
+  }
+}
+const HEAD = tpl([            // 3/4 view facing right; hat covers rows 0-2
+  '...HHHHHH...',
+  '.HHHHHHHHHH.',
+  'HHHHHHHHHHHH',
+  'HHHLLLHHHHHH',
+  'HHLLHHHHHDHH',
+  'DHHHHHDHHDHH',
+  'DHHHDHSHHSHS',
+  'DHHHDSEEHSES',
+  'DHHHDSIWSSIS',
+  'DHHDDSIISSIS',
+  'DDHDDspSSsS.',
+  '.DD...sSSs..'
+]);
+const TORSO = tpl([
+  '.wWWWWWw.',
+  'wWWWRGRWw',
+  '.bBBRBRh.',
+  '.bBBBBBh.',
+  '..bBBBh..',
+  '..gGGGg..'
+]);
+const BOOT = tpl([
+  'wWW..',
+  'bBBB.',
+  'bBBBh',
+  'bbbbb'
+]);
+const BOW = tpl([
+  'RR.RR',
+  'RRGRR',
+  'RR.RR',
+  '.R.R.'
+]);
+const RING = tpl([
+  '..gGG..',
+  '.g...G.',
+  'g.....G',
+  'g.....G',
+  'g.....G',
+  '.g...g.',
+  '..ggg..'
+]);
+
+// clean pixel-art line slopes for the staff (0, 1:3, 1:2, 1:1, 2:1, 3:1, 90°)
+const DIRS = (() => {
+  const base = [[1, 0], [3, 1], [2, 1], [1, 1], [1, 2], [1, 3], [0, 1]], out = [], seen = {};
+  for (const sx of [1, -1]) for (const sy of [1, -1]) for (const b of base) {
+    const x = b[0] * sx, y = b[1] * sy, k = x + ',' + y;
+    if (seen[k]) continue; seen[k] = 1;
+    const l = Math.hypot(x, y); out.push(x / l, y / l);
+  }
+  return new Float32Array(out);
+})();
+const ND = DIRS.length / 2;
+
+// =====================================================================
+//  ANIMATION TRACKS  [tick, value, easeIntoThisKey, ...]
+// =====================================================================
+const LIN = 0, IQ = 1, OQ = 2, IO = 3, OC = 4, ST = 5;
+function ease(e, u) {
+  switch (e) {
+    case IQ: return u * u;
+    case OQ: return 1 - (1 - u) * (1 - u);
+    case IO: return 0.5 - 0.5 * Math.cos(Math.PI * u);
+    case OC: { const v = 1 - u; return 1 - v * v * v; }
+    case ST: return 0;
+  }
+  return u;
+}
+function tr(k, t) {
+  const n = k.length;
+  if (t <= k[0]) return k[1];
+  for (let i = 3; i < n; i += 3) {
+    if (t < k[i]) {
+      const t0 = k[i - 3], v0 = k[i - 2];
+      return v0 + (k[i + 1] - v0) * ease(k[i + 2], (t - t0) / (k[i] - t0));
+    }
+  }
+  return k[n - 2];
+}
+const F = a => new Float32Array(a);
+//  0-120 idle | 120-150 anticipation | 150-212 charge | 212-220 strike | 220-228 flash+hit-stop
+//  228-240 projectile | 240+ impact | 228-300 recover | 300-360 idle
+const K = {
+  bx:   F([0,0,0, 120,0,0, 142,-1,IO, 205,-1,0, 212,-2,IO, 220,2,OC, 228,2,0, 262,1,IO, 292,0,IO, 360,0,0]),
+  by:   F([0,0,0, 120,0,0, 142,2,IO, 150,2,0, 170,-1,OQ, 185,0,IO, 205,0,0, 212,1,IO, 228,1,0, 255,0,IO, 360,0,0]),
+  bw:   F([0,1,0, 112,1,0, 122,0,LIN, 290,0,0, 305,1,LIN, 360,1,0]),
+  hdx:  F([0,0,0, 219,0,0, 220,1,ST, 240,1,0, 262,0,IO, 360,0,0]),
+  hdy:  F([0,0,0, 128,0,0, 140,1,IO, 158,1,0, 168,-1,OQ, 182,0,IO, 219,0,0, 220,1,ST, 228,1,0, 234,0,IO, 360,0,0]),
+  eye:  F([0,0,0, 60,2,ST, 65,1,ST, 70,0,ST, 126,2,ST, 196,3,ST, 238,0,ST, 272,4,ST, 296,0,ST, 330,2,ST, 335,1,ST, 340,0,ST, 360,0,0]),
+  mouth:F([0,0,0, 126,1,ST, 212,2,ST, 238,0,ST, 272,3,ST, 296,0,ST, 360,0,0]),
+  ang:  F([0,-63.4,0, 120,-63.4,0, 142,-45,IO, 150,-45,0, 172,-71.6,OQ, 205,-71.6,0, 212,-108,IO, 220,-18.4,OC, 228,-18.4,0, 252,-45,OQ, 275,-74,IO, 295,-63.4,IO, 360,-63.4,0]),
+  fhx:  F([0,5,0, 120,5,0, 142,4,IO, 150,4,0, 172,7,OQ, 205,7,0, 212,6,IO, 220,8,OC, 228,8,0, 252,7,OQ, 280,5,IO, 360,5,0]),
+  fhy:  F([0,-11,0, 120,-11,0, 142,-10,IO, 150,-10,0, 172,-24,OQ, 205,-24,0, 212,-25,IO, 220,-17,OC, 228,-17,0, 252,-13,OQ, 280,-11,IO, 360,-11,0]),
+  bhx:  F([0,3,0, 120,3,0, 142,5,IO, 172,10,OQ, 205,10,0, 212,7,IO, 220,-6,OC, 228,-6,0, 262,0,IO, 290,3,IO, 360,3,0]),
+  bhy:  F([0,-11,0, 120,-11,0, 142,-15,IO, 172,-19,OQ, 205,-19,0, 212,-18,IO, 220,-15,OC, 228,-15,0, 262,-12,IO, 290,-11,IO, 360,-11,0]),
+  ffx:  F([0,0,0, 219,0,0, 220,2,ST, 264,2,0, 265,0,ST, 360,0,0]),
+  tail: F([0,0,0, 125,0,0, 145,-1.5,IO, 162,0.5,IO, 180,0,IO, 205,0,0, 212,-1,IO, 228,-1,0, 233,4.5,OC, 240,5,LIN, 256,-1.5,IO, 272,0.8,IO, 292,0,IO, 360,0,0]),
+  cape: F([0,0,0, 128,0,0, 150,-1.5,IO, 168,0.5,IO, 185,0,IO, 205,0,0, 212,-1,IO, 228,-1,0, 236,4,OC, 246,4.5,LIN, 264,-1.2,IO, 282,0.5,IO, 305,0,IO, 360,0,0]),
+  lift: F([0,0,0, 155,0,0, 180,1,OQ, 212,1,0, 228,0.7,LIN, 248,0,IO, 360,0,0]),
+  skirt:F([0,0,0, 128,0,0, 145,-1,IO, 165,0,IO, 228,0,0, 233,2,OC, 244,1.5,LIN, 258,-0.7,IO, 274,0,IO, 360,0,0]),
+  hat:  F([0,0,0, 130,0,0, 145,1,IO, 170,-1,OQ, 212,-1,0, 228,-1,0, 234,2,OC, 250,-1,IO, 268,0.5,IO, 288,0,IO, 360,0,0]),
+  glow: F([0,1,0, 158,2,ST, 170,3,ST, 185,4,ST, 200,5,ST, 220,6,ST, 229,2,ST, 245,1,ST, 360,1,0]),
+  rim:  F([0,6,0, 150,6,0, 175,14,LIN, 205,22,LIN, 220,48,ST, 228,48,0, 234,12,OQ, 260,6,IO, 360,6,0]),
+  circ: F([0,0,0, 158,1,ST, 166,2,ST, 176,3,ST, 220,4,ST, 229,3,ST, 240,2,ST, 252,1,ST, 264,0,ST, 360,0,0])
+};
+const CIRC_R = F([0, 7, 11, 15, 16]);
+const CIRC_L = F([0, 0.45, 0.75, 1.05, 1.6]);
+const WAVE_T = [152, 164, 176, 187, 197];
+const ARM_REACH = 10.6;
+const SHX = [2, -2, 1, -1, 1, 0], SHY = [1, -1, 1, 0, 0, 0];   // cast shake (per 2 ticks)
+const IHX = [0, 1, -1, 0], IHY = [1, -1, 1, 0];                // impact shake
+
+// current pose (mutated in place, no per-frame allocation)
+const P = { bx: 0, by: 0, hdx: 0, hdy: 0, eye: 0, mouth: 0, hx: 0, hy: 0, bhx: 0, bhy: 0, ffx: 0,
+            tail: 0, tailF: 0, cape: 0, lift: 0, skirt: 0, hat: 0, glow: 1, rim: 0, circ: 0,
+            dx: 0, dy: -1, gx: 0, gy: 0 };
+let T = L - 1, TQ = 0;
+let projSX = 0, projSY = 0;
+
+function samplePose(tq) {
+  const bxv = tr(K.bx, tq), byv = tr(K.by, tq);
+  const breath = Math.sin(TAU * tq / 90 + 0.4) > 0.25 ? 1 : 0;       // stepped 1px breathing
+  const ib = R(byv);
+  P.bx = R(bxv);
+  P.by = R(byv + tr(K.bw, tq) * breath);
+  P.hdx = R(tr(K.hdx, tq)); P.hdy = R(tr(K.hdy, tq));
+  P.eye = R(tr(K.eye, tq)); P.mouth = R(tr(K.mouth, tq));
+  const jit = (tq >= 190 && tq < 212) ? ((tq / Q) & 1) : 0;           // strained tremble
+  let hx = CX + P.bx + R(tr(K.fhx, tq)) + jit, hy = GY + ib + R(tr(K.fhy, tq));
+  const shx = CX + P.bx - 2, shy = GY + P.by - 18, sdx = hx - shx, sdy = hy - shy, sd = Math.hypot(sdx, sdy);
+  if (sd > ARM_REACH) { hx = shx + sdx * ARM_REACH / sd; hy = shy + sdy * ARM_REACH / sd; }  // keep grip reachable
+  P.hx = R(hx); P.hy = R(hy);
+  P.bhx = CX + P.bx + R(tr(K.bhx, tq));
+  P.bhy = GY + ib + R(tr(K.bhy, tq));
+  P.ffx = R(tr(K.ffx, tq));
+  P.tail = tr(K.tail, tq); P.tailF = tr(K.tail, (tq - Q + L) % L);
+  P.cape = tr(K.cape, tq); P.lift = tr(K.lift, tq); P.skirt = tr(K.skirt, tq);
+  P.hat = tr(K.hat, tq) + Math.sin(TAU * tq / 120 + 1) * 0.7 + P.lift * Math.sin(TAU * tq / 20) * 0.9;
+  let g = R(tr(K.glow, tq));
+  if (g === 1 && (tq % 90) < 20) g = 2;                                 // idle gem pulse
+  P.glow = g;
+  P.rim = tr(K.rim, tq); P.circ = R(tr(K.circ, tq));
+  const a = tr(K.ang, tq) * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+  let best = 0, bd = -2;
+  for (let i = 0; i < ND; i++) {
+    const d = DIRS[i * 2] * ca + DIRS[i * 2 + 1] * sa;
+    if (d > bd) { bd = d; best = i; }
+  }
+  P.dx = DIRS[best * 2]; P.dy = DIRS[best * 2 + 1];
+  P.gx = R(P.hx + P.dx * 16); P.gy = R(P.hy + P.dy * 16);
+}
+
+// =====================================================================
+//  CHARACTER PARTS
+// =====================================================================
+function commit(outlined, flag) {
+  if (pbx1 < 0) return;
+  const x0 = pbx0 - 1, x1 = pbx1 + 1, y0 = pby0 - 1, y1 = pby1 + 1;
+  for (let y = y0; y <= y1; y++) {
+    let i = y * W + x0;
+    for (let x = x0; x <= x1; x++, i++) {
+      const c = pb[i];
+      if (c) { cb[i] = c; cf[i] = flag; }
+      else if (outlined) {
+        const n = pb[i - 1] || pb[i + 1] || pb[i - W] || pb[i + W];
+        if (n) { cb[i] = OUTL[n]; cf[i] = 1; }
+      }
+    }
+  }
+  for (let y = pby0; y <= pby1; y++) pb.fill(0, y * W + pbx0, y * W + pbx1 + 1);
+  pbx0 = W; pby0 = H; pbx1 = -1; pby1 = -1;
+}
+function lineP(x0, y0, x1, y1, c) {
+  x0 = R(x0); y0 = R(y0); x1 = R(x1); y1 = R(y1);
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let e = dx + dy;
+  for (;;) {
+    pp(x0, y0, c);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * e;
+    if (e2 >= dy) { e += dy; x0 += sx; }
+    if (e2 <= dx) { e += dx; y0 += sy; }
+  }
+}
+function thickP(x0, y0, x1, y1, c) {      // 2x2 brush line
+  x0 = R(x0 - 0.5); y0 = R(y0 - 0.5); x1 = R(x1 - 0.5); y1 = R(y1 - 0.5);
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let e = dx + dy;
+  for (;;) {
+    pp(x0, y0, c); pp(x0 + 1, y0, c); pp(x0, y0 + 1, c); pp(x0 + 1, y0 + 1, c);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * e;
+    if (e2 >= dy) { e += dy; x0 += sx; }
+    if (e2 <= dx) { e += dx; y0 += sy; }
+  }
+}
+function blkP(x, y, c) {
+  const x0 = R(x - 0.5), y0 = R(y - 0.5);
+  pp(x0, y0, c); pp(x0 + 1, y0, c); pp(x0, y0 + 1, c); pp(x0 + 1, y0 + 1, c);
+}
+function shadeTop(base, hi) {             // light from above on the current part
+  for (let y = pby0; y <= pby1; y++) for (let x = pbx0; x <= pbx1; x++) {
+    const i = y * W + x;
+    if (pb[i] === base && pb[i - W] === 0) pb[i] = hi;
+  }
+}
+
+function drawCape(X, Y) {
+  const lift = P.lift, sw = P.cape;
+  const n = 11 - R(lift * 2);
+  const lin = 1 + R(lift * 2 + Math.max(0, sw) * 0.35);
+  for (let k = 0; k < n; k++) {
+    const f = k / (n - 1);
+    const wave = (Math.sin(TAU * TQ / 120 - f * 2 + 0.8) * 0.6 + lift * Math.sin(TAU * TQ / 20 - f * 3.5 + 2)) * f;
+    const xl = R(X - 4 - k * 0.6 - sw * Math.pow(f, 1.5) - lift * f * 2.6 + wave), y = Y - 19 + k;
+    for (let x = xl; x <= X + 1; x++) {
+      let c = CS;
+      if (k >= n - lin && x <= xl + 2) c = RD;                 // red lining flips up
+      else if (x === xl + 1 && k > 0 && k < n - 2) c = CB;     // fold highlight
+      pp(x, y, c);
+    }
+  }
+}
+function drawTail(rx, ry, len, bend, sway, lift, ph, far) {
+  const cH = far ? HD : HB, cD = far ? HO : HD, cL = far ? HB : HL;
+  const sq = 1 - lift * 0.18;
+  for (let r = 0; r <= len; r++) {
+    const t = r / len;
+    const wave = (Math.sin(TAU * TQ / 120 - t * 2.4 + ph) * 0.7 + lift * Math.sin(TAU * TQ / 20 - t * 4.5 + ph) * 1.1) * t;
+    const cx = rx - bend * Math.sin(t * 2.75) - sway * Math.pow(t, 1.4) - lift * t * 2.8 + wave;
+    const y = R(ry + r * sq);
+    const w = t < 0.2 ? 2.4 + t * 8 : 1 + 3 * Math.pow(1 - (t - 0.2) / 0.8, 0.85);
+    const xl = R(cx - w * 0.5);
+    let xr = R(cx + w * 0.5) - 1; if (xr < xl) xr = xl;
+    for (let x = xl; x <= xr; x++) {
+      let c = cH;
+      if (t > 0.9) c = cD;
+      else if (x === xl && xr > xl) c = cD;
+      else if (x === xr - 1 && t > 0.06 && t < 0.42 && xr - xl >= 2) c = cL;
+      pp(x, y, c);
+    }
+  }
+}
+function drawArm(sx, sy, hx, hy, a, b, near) {
+  let dx = hx - sx, dy = hy - sy, d = Math.sqrt(dx * dx + dy * dy);
+  const mx = a + b - 0.2;
+  if (d > mx) { hx = sx + dx * mx / d; hy = sy + dy * mx / d; dx = hx - sx; dy = hy - sy; d = mx; }
+  if (d < 1) d = 1;
+  let ca = (a * a + d * d - b * b) / (2 * a * d);
+  if (ca > 1) ca = 1; if (ca < -1) ca = -1;
+  const al = Math.acos(ca), ph = Math.atan2(dy, dx);
+  const e1x = sx + Math.cos(ph + al) * a, e1y = sy + Math.sin(ph + al) * a;
+  const e2x = sx + Math.cos(ph - al) * a, e2y = sy + Math.sin(ph - al) * a;
+  const ex = e1y >= e2y ? e1x : e2x, ey = e1y >= e2y ? e1y : e2y;    // elbow bends downward
+  const base = near ? CB : CS, hi = near ? CH : CB;
+  thickP(sx, sy, ex, ey, base);
+  thickP(ex, ey, hx, hy, base);
+  if (near) { pp(sx - 1, sy - 1, base); pp(sx, sy - 1, base); pp(sx - 2, sy, base); }  // puffed shoulder
+  shadeTop(base, hi);
+  blkP(ex + (hx - ex) * 0.68, ey + (hy - ey) * 0.68, near ? WH : WS);   // cuff
+  blkP(hx, hy, near ? SK : SS);                                          // hand
+  if (near) pp(R(hx - 0.5), R(hy + 0.5), SS);
+}
+function drawLegs(X, Y) {
+  const hem = Y - 7, kneeTo = GY - 5, span = kneeTo - hem;
+  for (let y = hem + 1; y <= kneeTo; y++) {
+    const t = (y - hem) / span, x = R((X - 5) * (1 - t) + (CX - 5) * t);
+    pp(x, y, SS); pp(x + 1, y, SS);
+  }
+  stamp(BOOT, CX - 6, GY - 4, BOOTD);
+  commit(false, 0);
+  const fx = CX + P.ffx;
+  for (let y = hem + 1; y <= kneeTo; y++) {
+    const t = (y - hem) / span, x = R((X + 1) * (1 - t) + fx * t);
+    pp(x, y, SS); pp(x + 1, y, SK);
+  }
+  stamp(BOOT, CX - 1 + P.ffx, GY - 4);
+  commit(true, 0);
+}
+function drawSkirt(X, Y) {
+  const sh = P.skirt, lift = P.lift;
+  for (let k = 0; k < 7; k++) {
+    const f = k / 6, y = Y - 13 + k, off = sh * f * f;
+    const xl = R(X - 3 - k * 0.75 - lift * f * 1.3 - off), xr = R(X + 3 + k * 0.62 + lift * f * 1.3 - off);
+    const open = k >= 2 ? xr - (k - 2) * 0.5 - 0.5 : 999;
+    for (let x = xl; x <= xr; x++) {
+      const rel = (x - xl) / (xr - xl);
+      const pleat = ((x - X + 60) % 3) === 0;
+      let c = CB;
+      if (k === 6) c = pleat ? WS : WH;                        // lace hem
+      else if (x >= open) c = (x === R(open) && k > 2) ? WS : WH;   // white underskirt at front slit
+      else if (rel < 0.2) c = CS;
+      else if (rel > 0.82) c = CH;
+      else if (k >= 2 && pleat) c = CS;
+      pp(x, y, c);
+    }
+  }
+}
+function drawHead(hox, hoy) {
+  stamp(HEAD, hox, hoy);
+  const e = P.eye;
+  const iris = (e === 3 || (e === 2 && P.glow >= 3)) ? M2 : M1;
+  const shine = e === 3 ? HOT : WH;
+  if (e === 1 || e === 4) {             // closed
+    pp(hox + 6, hoy + 7, SK); pp(hox + 7, hoy + 7, SK); pp(hox + 10, hoy + 7, SK);
+    pp(hox + 6, hoy + 8, OUT); pp(hox + 7, hoy + 8, OUT); pp(hox + 10, hoy + 8, OUT);
+    pp(hox + 6, hoy + 9, SK); pp(hox + 7, hoy + 9, SK); pp(hox + 10, hoy + 9, SK);
+  } else if (e === 2) {                 // focused, lowered lids
+    pp(hox + 6, hoy + 7, SK); pp(hox + 7, hoy + 7, SK); pp(hox + 10, hoy + 7, SK);
+    pp(hox + 6, hoy + 8, OUT); pp(hox + 7, hoy + 8, OUT); pp(hox + 10, hoy + 8, OUT);
+    pp(hox + 6, hoy + 9, iris); pp(hox + 7, hoy + 9, iris); pp(hox + 10, hoy + 9, iris);
+  } else {                              // open / fierce
+    pp(hox + 6, hoy + 8, iris); pp(hox + 7, hoy + 8, shine); pp(hox + 10, hoy + 8, iris);
+    pp(hox + 6, hoy + 9, iris); pp(hox + 7, hoy + 9, iris); pp(hox + 10, hoy + 9, iris);
+  }
+  switch (P.mouth) {
+    case 1: pp(hox + 8, hoy + 10, SS); pp(hox + 9, hoy + 10, SS); break;
+    case 2: pp(hox + 8, hoy + 10, HO); pp(hox + 9, hoy + 10, HO); pp(hox + 8, hoy + 11, HD); break;
+    case 3: pp(hox + 8, hoy + 10, SS); pp(hox + 9, hoy + 10, HD); break;
+  }
+}
+function drawHat(hox, hoy) {
+  const b = P.hat;
+  for (let x = hox - 1; x <= hox + 12; x++) pp(x, hoy + 1, CS);
+  for (let x = hox - 3; x <= hox + 14; x++) pp(x, hoy + 2, x < hox ? CS : x > hox + 11 ? CH : CB);
+  pp(hox - 3, hoy + 3, CS); pp(hox - 2, hoy + 3, CS); pp(hox + 13, hoy + 3, CB); pp(hox + 14, hoy + 3, CB);
+  for (let x = hox + 2; x <= hox + 10; x++) pp(x, hoy + 1, RD);          // ribbon band
+  const CRL = [2, 2, 1, 1, 0, 0], CRR = [9, 8, 7, 6, 5, 4];
+  for (let j = 0; j < 6; j++) {
+    const y = hoy - j, x0 = hox + CRL[j], x1 = hox + CRR[j];
+    for (let x = x0; x <= x1; x++) pp(x, y, x === x0 ? CS : x === x1 ? CH : (j === 3 && x === x0 + 2) ? CS : CB);
+  }
+  for (let x = hox - 1; x <= hox + 2; x++) pp(x, hoy - 6, x === hox - 1 ? CS : x === hox + 2 ? CH : CB);
+  // floppy tip (secondary motion)
+  pp(hox - 2, hoy - 6 + R(b * 0.4), CB); pp(hox - 2, hoy - 5 + R(b * 0.4), CS);
+  pp(hox - 3, hoy - 6 + R(b * 0.6), CB);
+  pp(hox - 4, hoy - 5 + R(b * 0.9), CS);
+  pp(hox - 5, hoy - 4 + R(b * 1.2), CS);
+  // gold star charm
+  pp(hox + 9, hoy + 1, GL); pp(hox + 8, hoy + 1, GL); pp(hox + 10, hoy + 1, GL); pp(hox + 9, hoy, GL); pp(hox + 9, hoy + 2, GD);
+}
+function drawStaff() {
+  const hx = P.hx, hy = P.hy, dx = P.dx, dy = P.dy, gx = P.gx, gy = P.gy, g = P.glow;
+  lineP(hx - dx * 11, hy - dy * 11, hx + dx * 12, hy + dy * 12, WS);
+  pp(hx - dx * 11, hy - dy * 11, GD);
+  pp(hx + dx * 11, hy + dy * 11, GD); pp(hx + dx * 12, hy + dy * 12, GL);
+  stamp(RING, gx - 3, gy - 3);
+  if (g >= 2) {
+    const f = g >= 4 ? M1 : M0;
+    for (let yy = -2; yy <= 2; yy++) for (let xx = -2; xx <= 2; xx++)
+      if (xx * xx + yy * yy <= 5 && Math.abs(xx) + Math.abs(yy) >= 2) pp(gx + xx, gy + yy, f);
+  }
+  const cc = g <= 1 ? M2 : g === 2 ? M3 : HOT, ca = g <= 1 ? M1 : g <= 3 ? M2 : M3;
+  pp(gx, gy, cc); pp(gx - 1, gy, ca); pp(gx + 1, gy, ca); pp(gx, gy - 1, ca); pp(gx, gy + 1, ca);
+  pp(gx + dx * 4.2, gy + dy * 4.2, GL); pp(gx + dx * 5.2, gy + dy * 5.2, GL);
+}
+function drawCharacter() {
+  const X = CX + P.bx, Y = GY + P.by, lift = P.lift;
+  const hox = X - 5 + P.hdx, hoy = Y - 32 + P.hdy;
+  drawCape(X, Y); commit(false, 0);
+  drawTail(hox + 3, hoy + 3, 16, 2.5, P.tailF, lift, 1.3, true); commit(true, 0);
+  drawArm(X + 3, Y - 18, P.bhx, P.bhy, 4, 5, false); commit(true, 0);
+  drawLegs(X, Y);
+  drawSkirt(X, Y); commit(true, 0);
+  stamp(TORSO, X - 4, Y - 19); commit(true, 0);
+  pp(X + 1, Y - 20, SS); pp(X + 2, Y - 20, SS); pp(X + 1, Y - 21, SS); pp(X + 2, Y - 21, SS); commit(false, 0);
+  const raised = P.hy < Y - 20;          // staff held up beside the head passes behind hair and hat
+  if (raised) {                          // raised arm tucks behind the face so the expression stays readable
+    drawStaff(); commit(true, 2);
+    drawArm(X - 2, Y - 18, P.hx, P.hy, 5, 6, true); commit(true, 0);
+  }
+  drawTail(hox - 1, hoy + 6, 19, 4, P.tail, lift, 0, false); commit(true, 0);
+  drawHead(hox, hoy); commit(true, 0);
+  stamp(BOW, hox - 3, hoy + 4); commit(true, 0);
+  drawHat(hox, hoy); commit(true, 0);
+  if (!raised) {
+    drawStaff(); commit(true, 2);
+    drawArm(X - 2, Y - 18, P.hx, P.hy, 5, 6, true); commit(true, 0);
+  }
+}
+function rimLight(lx, ly, rad, map, wrap) {
+  if (rad <= 0) return;
+  const R2 = rad * rad;
+  const y0 = Math.max(1, Math.floor(ly - rad)), y1 = Math.min(H - 2, Math.ceil(ly + rad));
+  const x0 = Math.max(1, Math.floor(lx - rad)), x1 = Math.min(W - 2, Math.ceil(lx + rad));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const i = y * W + x, c = cb[i];
+    if (!c || (cf[i] & 7)) continue;
+    const dx = lx - x, dy = ly - y;
+    if (dx * dx + dy * dy > R2) continue;
+    const ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+    const sx = ax > 0.414 * ay ? (dx > 0 ? 1 : -1) : 0, sy = ay > 0.414 * ax ? (dy > 0 ? 1 : -1) : 0;
+    if (!sx && !sy) continue;
+    const j = i + sy * W + sx, cj = cb[j];
+    let ok = cj === 0;
+    if (!ok && (cf[j] & 1)) { const k = j + sy * W + sx; ok = k >= 0 && k < W * H && cb[k] === 0; }
+    if (ok) { cb[i] = map[c]; cf[i] |= 4; if (wrap && cj) cb[j] = M0; }
+  }
+}
+function finishChar(flash, t) {
+  // global silhouette outline for parts without their own outline
+  for (let y = 1; y < H - 1; y++) {
+    let i = y * W + 1;
+    for (let x = 1; x < W - 1; x++, i++) {
+      if (cb[i]) continue;
+      let j = -1;
+      if (cb[i - 1] && !(cf[i - 1] & 1)) j = i - 1;
+      else if (cb[i + 1] && !(cf[i + 1] & 1)) j = i + 1;
+      else if (cb[i - W] && !(cf[i - W] & 1)) j = i - W;
+      else if (cb[i + W] && !(cf[i + W] & 1)) j = i + W;
+      if (j >= 0) { cb[i] = OUTL[cb[j]]; cf[i] = 1; }
+    }
+  }
+  if (!flash) {
+    rimLight(P.gx, P.gy, P.rim, P.glow >= 3 ? RIMS : RIMW, P.glow >= 5);
+    if (t >= 240 && t < 246) rimLight(IX, IY, 110, RIMW, false);     // blast light from the right
+  }
+  for (let y = 0; y < H; y++) {
+    const ty = y + camY;
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x, c = cb[i];
+      if (!c) continue;
+      const tx = x + camX;
+      if (tx >= 0 && tx < W && ty >= 0 && ty < H) buf[ty * W + tx] = flash ? OUT : c;
+      cb[i] = 0; cf[i] = 0;
+    }
+  }
+}
+
+// =====================================================================
+//  STATIC SCENE
+// =====================================================================
+const TWMAX = 12, twX = new Int16Array(TWMAX), twY = new Int16Array(TWMAX);
+let TWN = 0;
+const CRACK = [101,57, 102,58, 102,59, 103,60, 104,61, 104,62, 105,63, 105,64, 102,61, 101,62, 101,63, 102,64, 103,56, 104,55];
+const PT = [49, 47, 46, 48, 50, 48, 51, 53];
+function inPillar(x, y) {
+  if (x >= 100 && x <= 107 && y >= PT[x - 100] && y <= 77) return true;
+  if (x >= 99 && x <= 108 && (y === 70 || y === 71)) return true;
+  if (x >= 97 && x <= 110 && y >= 78 && y <= 81) return true;
+  return false;
+}
+function buildStatic() {
+  rs = 0x5EED1;
+  for (let y = -MG; y < H + MG; y++) for (let x = -MG; x < W + MG; x++) {
+    let c = BG0;
+    if (y >= 63) c = BG2;
+    else if (y >= 55) c = ((y - 55 + 0.5) / 8 > bay(x, y)) ? BG2 : BG1;
+    else if (y >= 34) c = BG1;
+    else if (y >= 26) c = ((y - 26 + 0.5) / 8 > bay(x, y)) ? BG1 : BG0;
+    bs(x, y, c);
+  }
+  // stars
+  for (let i = 0; i < 48; i++) {
+    const x = (rnd() * W) | 0, y = (rnd() * 60) | 0, r = rnd();
+    const mdx = x - 99, mdy = y - 16;
+    if (mdx * mdx + mdy * mdy < 150) continue;
+    if (x > 12 && x < 54 && y > 38) continue;           // keep the space behind the witch calm
+    bs(x, y, r < 0.55 ? BG2 : r < 0.88 ? ST2 : WS);
+    if (r > 0.72 && TWN < TWMAX) { twX[TWN] = x; twY[TWN] = y; TWN++; }
+  }
+  const plus = (x, y) => { bs(x, y, WS); bs(x - 1, y, BG2); bs(x + 1, y, BG2); bs(x, y - 1, BG2); bs(x, y + 1, BG2); };
+  plus(14, 9); plus(58, 21); plus(121, 40);
+  // moon
+  const mx = 99, my = 16;
+  for (let dy = -11; dy <= 11; dy++) for (let dx = -11; dx <= 11; dx++) {
+    const d2 = dx * dx + dy * dy;
+    if (d2 <= 56) {
+      const s = (-dx + dy) * 0.7071;
+      let c = WS;
+      if (s > 3.2 || (s > 2.0 && bay(mx + dx, my + dy) < 0.5)) c = ST2;
+      if (s < -4.4) c = WH;
+      bs(mx + dx, my + dy, c);
+    } else if (d2 >= 92 && d2 <= 112 && ((dx + dy) & 1) === 0) bs(mx + dx, my + dy, BG2);
+  }
+  bs(100, 13, ST2); bs(101, 13, ST2); bs(97, 17, ST2); bs(102, 17, ST2); bs(99, 20, ST2);
+  // far mountains
+  for (let x = -MG; x < W + MG; x++) {
+    const top = R(67 + 3 * Math.sin(x * 0.061 + 0.7) + 2 * Math.sin(x * 0.17 + 2.1) + Math.sin(x * 0.37 + 1));
+    for (let y = top; y < 76; y++) bs(x, y, BG1);
+  }
+  // distant ruins
+  const rect = (x, y, w, h, c) => { for (let yy = y; yy < y + h; yy++) for (let xx = x; xx < x + w; xx++) bs(xx, yy, c); };
+  rect(60, 57, 3, 19, BG0); rect(72, 58, 3, 18, BG0);          // ruined gate: two columns
+  rect(58, 55, 8, 2, BG0); rect(69, 56, 8, 2, BG0);            // broken lintel halves
+  bs(66, 56, BG0); bs(68, 57, BG0); bs(77, 57, BG0); bs(57, 56, BG0);
+  rect(67, 73, 3, 3, BG0); rect(79, 72, 2, 4, BG0);
+  // stone platform
+  const md = (a, m) => ((a % m) + m) % m;
+  for (let x = -MG; x < W + MG; x++) {
+    bs(x, 76, ST2);
+    for (let y = 77; y <= 88; y++) {
+      let c = ST1;
+      if (y === 80 || y === 85) c = ST0;
+      else if (y < 80) { if (md(x + 3, 11) === 0) c = ST0; else if (y === 77 && md(x + 2, 11) < 2) c = ST2; }
+      else if (y < 85) { if (md(x + 9, 14) === 0) c = ST0; else if (y === 81 && md(x + 8, 14) < 3) c = ST2; }
+      else { if (md(x + 1, 18) === 0) c = ST0; else if (y === 86 && md(x, 18) < 3) c = ST2; }
+      bs(x, y, c);
+    }
+    bs(x, 89, ST2);
+    for (let y = 90; y < H + MG; y++) {
+      const r = ((y - 90) / 3) | 0, ry = (y - 90) % 3;
+      let c = ST0;
+      if (ry === 2 || md(x + r * 4, 9) === 0) c = BG0;
+      else if (ry === 0 && md(x + r * 4, 9) === 1) c = ST1;
+      bs(x, y, c);
+    }
+  }
+  for (let i = 0; i < 44; i++) {
+    const x = (rnd() * W) | 0, y = 77 + ((rnd() * 12) | 0);
+    if (y === 80 || y === 85) continue;
+    bs(x, y, rnd() < 0.62 ? ST0 : ST2);
+  }
+  // target pillar
+  const PS = [ST0, ST1, ST0, ST1, ST1, ST2, ST1, ST2];
+  for (let y = 40; y <= 83; y++) for (let x = 95; x <= 112; x++) {
+    if (inPillar(x, y)) {
+      let c;
+      if (y >= 78) c = y === 78 ? ST2 : y === 81 ? ST0 : ST1;
+      else if (y === 70) c = ST2;
+      else if (y === 71) c = ST0;
+      else c = y === PT[x - 100] ? ST2 : PS[x - 100];
+      bs(x, y, c);
+    } else if (inPillar(x - 1, y) || inPillar(x + 1, y) || inPillar(x, y - 1) || inPillar(x, y + 1)) bs(x, y, BG0);
+  }
+  for (let i = 0; i < CRACK.length; i += 2) bs(CRACK[i], CRACK[i + 1], ST0);
+  bs(92, 82, ST2); bs(93, 82, ST1); bs(92, 83, BG0); bs(93, 83, BG0);
+  bs(113, 81, ST2); bs(114, 81, ST1); bs(114, 80, ST2); bs(113, 82, BG0); bs(114, 82, BG0);
+  bs(88, 84, ST2); bs(88, 85, BG0);
+  // foreground rubble silhouettes
+  for (let x = -MG; x <= 19; x++) {
+    const u = (x - 4) / 13, top = 86 + R(u * u * 8);
+    for (let y = top; y < H + MG; y++) fs(x, y, y === top && (x & 3) !== 0 ? ST0 : OUT);
+  }
+  fs(7, 89, ST0); fs(8, 89, ST0); fs(3, 91, ST0);
+  for (let x = 113; x < W + MG; x++) {
+    const top = x < 115 ? 92 : 90;
+    for (let y = top; y < H + MG; y++) fs(x, y, y === top ? ST0 : OUT);
+  }
+  for (let y = 91; y < H + MG; y++) fs(120, y, ST0);
+}
+
+// =====================================================================
+//  PARTICLE POOL (fixed, reused)
+// =====================================================================
+const NP = 320;
+const pT = new Uint8Array(NP);
+const pX = new Float32Array(NP), pY = new Float32Array(NP), pLX = new Float32Array(NP), pLY = new Float32Array(NP),
+      pVX = new Float32Array(NP), pVY = new Float32Array(NP), pA = new Float32Array(NP), pB = new Float32Array(NP),
+      pC = new Float32Array(NP), pAge = new Float32Array(NP), pLife = new Float32Array(NP);
+let pCur = 0;
+const CONV = 1, SPARK = 2, DEBRIS = 3, EMBER = 4, TWINK = 5, MOTE = 6;
+function spawn(type, x, y, vx, vy, life, a, b, c) {
+  for (let n = 0; n < NP; n++) {
+    const i = (pCur + n) % NP;
+    if (pT[i] === 0) {
+      pCur = (i + 1) % NP;
+      pT[i] = type; pX[i] = pLX[i] = x; pY[i] = pLY[i] = y; pVX[i] = vx; pVY[i] = vy;
+      pAge[i] = 0; pLife[i] = life; pA[i] = a; pB[i] = b; pC[i] = c;
+      return;
+    }
+  }
+}
+function spawns(t) {
+  const gx = P.gx, gy = P.gy;
+  // idle: the gem breathes out faint motes
+  if ((t < 140 || t >= 262) && t % 30 === 0) spawn(EMBER, gx + rr(-2, 2), gy + rr(-2, 1), 0, -0.12 - rnd() * 0.1, 40 + rnd() * 20, rnd() * 6, 0, 0);
+  if ((t < 140 || t >= 270) && t % 60 === 30) spawn(TWINK, gx + rr(-7, 7), gy + rr(-7, 3), 0, 0, 20, 0, 0, 0);
+  // charge: shrinking rings of converging light
+  for (let w = 0; w < WAVE_T.length; w++) {
+    if (t !== WAVE_T[w]) continue;
+    const n = 8 + w * 2, r0 = 22 - w * 1.3, spin = (w & 1) ? 0.9 : -0.9;
+    for (let k = 0; k < n; k++) {
+      const a = k * TAU / n + w * 0.5 + rr(-0.12, 0.12), r = r0 * (0.92 + rnd() * 0.16);
+      const ox = Math.cos(a) * r, oy = Math.sin(a) * r * 0.85;
+      spawn(CONV, gx + ox, gy + oy, 0, 0, Math.min(20 + rnd() * 3, 211 - t), ox, oy, spin);
+    }
+  }
+  // charge: streams rising from the floor circle into the gem
+  if (t >= 170 && t < 206 && t % 3 === 0) {
+    const a = rnd() * TAU, sx = CX + 1 + Math.cos(a) * 15, sy = GY + 1 + Math.sin(a) * 4.2;
+    spawn(CONV, sx, sy, 0, 0, Math.max(5, Math.min(18 + rnd() * 6, 211 - t)), sx - gx, sy - gy, rr(-0.3, 0.3));
+  }
+  if (t >= 160 && t < 220 && t % 4 === 1) {
+    const a = rnd() * TAU, rx = CIRC_R[Math.max(1, P.circ)];
+    spawn(EMBER, CX + 1 + Math.cos(a) * rx, GY + 1 + Math.sin(a) * rx * 0.28, 0, -0.5 - rnd() * 0.5, 16 + rnd() * 14, rnd() * 6, 0, 0);
+  }
+  if (t >= 186 && t < 206 && t % 3 === 0) {
+    const a = rnd() * TAU, r = 9 + rnd() * 7, ox = Math.cos(a) * r, oy = Math.sin(a) * r;
+    spawn(CONV, gx + ox, gy + oy, 0, 0, Math.max(5, Math.min(10 + rnd() * 5, 211 - t)), ox, oy, rr(-1.5, 1.5));
+  }
+  // release
+  if (t === HS1) {
+    projSX = gx; projSY = gy;
+    const ang = Math.atan2(P.dy, P.dx);
+    for (let k = 0; k < 18; k++) {
+      const a = ang + rr(-0.65, 0.65), s = 1.6 + rnd() * 2.2;
+      spawn(SPARK, gx, gy, Math.cos(a) * s, Math.sin(a) * s, 10 + rnd() * 12, 0.86, 0.015, 0);
+    }
+    for (let k = 0; k < 10; k++) {
+      const a = k * TAU / 10 + rnd() * 0.3, s = 0.7 + rnd() * 0.6;
+      spawn(SPARK, gx, gy, Math.cos(a) * s, Math.sin(a) * s, 12 + rnd() * 8, 0.9, 0, 0);
+    }
+  }
+  if (t === 232 || t === 238) spawn(TWINK, gx + rr(-6, 4), gy + rr(-7, 2), 0, 0, 20, 0, 0, 0);
+  // projectile trail
+  if (t >= HS1 && t < 240) {
+    const u = (t - HS1) / 12, x = projSX + (IX - projSX) * u, y = projSY + (IY - projSY) * u;
+    spawn(MOTE, x + rr(-1, 1), y + rr(-1, 1), rr(-0.5, 0) - 0.2, rr(-0.45, 0.45), 10 + rnd() * 10, 0, 0, 0);
+    if (t & 1) spawn(MOTE, x, y + rr(-2, 2), -0.6, rr(-0.2, 0.2), 8 + rnd() * 6, 0, 0, 0);
+  }
+  // impact
+  if (t === 240) {
+    for (let k = 0; k < 26; k++) {
+      const a = Math.PI + rr(-1.35, 1.35), s = 1.2 + rnd() * 2.6;
+      spawn(SPARK, IX - 1, IY, Math.cos(a) * s, Math.sin(a) * s, 16 + rnd() * 18, 0.93, 0.06, 0);
+    }
+    for (let k = 0; k < 6; k++) {
+      const a = -Math.PI / 2 + rr(-0.5, 0.5), s = 1.5 + rnd() * 1.8;
+      spawn(SPARK, IX - 1, IY, Math.cos(a) * s, Math.sin(a) * s, 14 + rnd() * 10, 0.92, 0.06, 0);
+    }
+    for (let k = 0; k < 12; k++) {
+      spawn(DEBRIS, IX + rr(0, 2), IY + rr(-4, 4), -(0.4 + rnd() * 1.6), -(0.5 + rnd() * 2.0), 55 + rnd() * 15,
+            rnd() < 0.5 ? ST2 : ST1, rnd() < 0.4 ? 1 : 0, 80 + ((rnd() * 6) | 0));
+    }
+  }
+  if (t >= 246 && t < 300 && t % 3 === 0) spawn(EMBER, IX + rr(-9, 3), IY + rr(-6, 12), rr(-0.1, 0.1), -0.2 - rnd() * 0.35, 22 + rnd() * 24, rnd() * 6, 0, 0);
+  if (t === 250 || t === 258 || t === 268 || t === 281) spawn(TWINK, IX + rr(-14, 2), IY + rr(-12, 8), 0, 0, 20, 0, 0, 0);
+}
+function updateParticles(t) {
+  const gx = P.gx, gy = P.gy;
+  for (let i = 0; i < NP; i++) {
+    const ty = pT[i];
+    if (!ty) continue;
+    pAge[i]++;
+    if (pAge[i] >= pLife[i]) { pT[i] = 0; continue; }
+    pLX[i] = pX[i]; pLY[i] = pY[i];
+    switch (ty) {
+      case CONV: {
+        if (t >= 212 && t < 232) { pT[i] = 0; break; }   // absorbed before the swing
+        const u = pAge[i] / pLife[i], e = u * u, k = 1 - e, an = pC[i] * e;
+        const cs = Math.cos(an), sn = Math.sin(an), ox = pA[i], oy = pB[i];
+        pX[i] = gx + (ox * cs - oy * sn) * k; pY[i] = gy + (ox * sn + oy * cs) * k;
+        break;
+      }
+      case SPARK: pX[i] += pVX[i]; pY[i] += pVY[i]; pVX[i] *= pA[i]; pVY[i] = pVY[i] * pA[i] + pB[i]; break;
+      case DEBRIS:
+        pVY[i] += 0.14; pVX[i] *= 0.97; pX[i] += pVX[i]; pY[i] += pVY[i];
+        if (pY[i] >= pC[i] && pVY[i] > 0) {
+          pY[i] = pC[i]; pVY[i] *= -0.35; pVX[i] *= 0.55;
+          if (pVY[i] > -0.4) pVY[i] = 0;
+        }
+        break;
+      case EMBER: pY[i] += pVY[i]; pX[i] += pVX[i] + Math.sin(pAge[i] * 0.18 + pA[i]) * 0.12; pVY[i] *= 0.985; break;
+      case MOTE: pX[i] += pVX[i]; pY[i] += pVY[i]; pVX[i] *= 0.9; pVY[i] = pVY[i] * 0.9 + 0.012; break;
+    }
+  }
+}
+
+// =====================================================================
+//  VFX DRAWING (frame buffer)
+// =====================================================================
+function lineB(x0, y0, x1, y1, c) {
+  x0 = R(x0); y0 = R(y0); x1 = R(x1); y1 = R(y1);
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let e = dx + dy, n = 0;
+  for (;;) {
+    px(x0, y0, c);
+    if ((x0 === x1 && y0 === y1) || ++n > 64) break;
+    const e2 = 2 * e;
+    if (e2 >= dy) { e += dy; x0 += sx; }
+    if (e2 <= dx) { e += dx; y0 += sy; }
+  }
+}
+function ring(cx, cy, r, ry, c, broken) {
+  const steps = Math.max(10, R(r * 6.5));
+  for (let i = 0; i < steps; i++) {
+    if (broken && ((i * 7 + (r | 0) * 3) % 5) < 2) continue;
+    const a = i / steps * TAU;
+    px(cx + Math.cos(a) * r, cy + Math.sin(a) * ry, c);
+  }
+}
+function disc(cx, cy, r, c) {
+  const rr2 = r * r + r * 0.8, ir = Math.ceil(r);
+  for (let y = -ir; y <= ir; y++) for (let x = -ir; x <= ir; x++) if (x * x + y * y <= rr2) px(cx + x, cy + y, c);
+}
+function light(cx, cy, rx, ry, s, map) {
+  cx = R(cx) + camX; cy = R(cy) + camY;
+  const x0 = Math.max(0, Math.floor(cx - rx)), x1 = Math.min(W - 1, Math.ceil(cx + rx));
+  const y0 = Math.max(0, Math.floor(cy - ry)), y1 = Math.min(H - 1, Math.ceil(cy + ry));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const nx = (x - cx) / rx, ny = (y - cy) / ry, d = nx * nx + ny * ny;
+    if (d >= 1) continue;
+    if ((1 - Math.sqrt(d)) * s > bay(x - camX, y - camY)) { const i = y * W + x; buf[i] = map[buf[i]]; }
+  }
+}
+function drawCircle(t) {
+  const lv = P.circ;
+  if (!lv) return;
+  const fading = TQ >= 229;
+  const rx = fading ? 15 : CIRC_R[lv], ry = rx * 0.28, cx = CX + 1, cy = GY + 1;
+  let rc = M1, ru = M2, ic = M0;
+  if (lv === 1) { rc = M0; ru = M1; ic = 0; }
+  if (lv === 4) { rc = M2; ru = M3; ic = M1; }
+  if (fading) {
+    if (lv === 3) { rc = M1; ru = M2; ic = M0; }
+    else if (lv === 2) { rc = M0; ru = M1; ic = 0; }
+    else { rc = M0; ru = 0; ic = 0; }
+  }
+  const steps = Math.ceil(rx * 7);
+  for (let i = 0; i < steps; i++) {
+    if (fading && lv === 1 && (i & 1)) continue;
+    const a = i / steps * TAU;
+    px(cx + Math.cos(a) * rx, cy + Math.sin(a) * ry, rc);
+  }
+  if (ic) for (let i = 0; i < steps; i++) {
+    if (i % 3 === 0) continue;
+    const a = i / steps * TAU;
+    px(cx + Math.cos(a) * rx * 0.62, cy + Math.sin(a) * ry * 0.62, ic);
+  }
+  if (ru) {
+    const rot = t * 0.02;
+    for (let k = 0; k < 8; k++) {
+      const a = k * TAU / 8 + rot, x = cx + Math.cos(a) * rx * 0.81, y = cy + Math.sin(a) * ry * 0.81;
+      px(x, y, ru);
+      if (lv >= 3) px(x, y - 1, ru);
+    }
+  }
+}
+function rays(gx, gy, len, diag) {
+  const hot = Math.ceil(len * 0.5) + 1;
+  for (let i = 2; i <= len + 1; i++) {
+    const c = i <= hot ? HOT : i <= len ? M3 : M2;
+    if (diag) {
+      const j = i - 1;
+      if (j > Math.ceil(len * 0.7)) continue;
+      px(gx + j, gy + j, c); px(gx - j, gy - j, c); px(gx + j, gy - j, c); px(gx - j, gy + j, c);
+    } else { px(gx + i, gy, c); px(gx - i, gy, c); px(gx, gy + i, c); px(gx, gy - i, c); }
+  }
+}
+function drawGemFX(t) {
+  const g = P.glow, gx = P.gx, gy = P.gy;
+  if (g >= 3 && g <= 5) {
+    const hr = g === 5 ? 7 : 6, hc = g >= 4 ? M2 : M1, flip = (t >> 3) & 1;
+    for (let k = 0; k < 12; k++) {
+      if ((k & 1) !== flip) continue;
+      const a = k * TAU / 12 + t * 0.02;
+      px(gx + Math.cos(a) * hr, gy + Math.sin(a) * hr, hc);
+    }
+    rays(gx, gy, g === 3 ? 2 : g === 4 ? 3 : 5, g === 5 && ((t >> 2) & 1) === 1);
+    const sp = 0.05 + 0.035 * (g - 3);
+    for (let k = 0; k < 3; k++) {
+      const a = t * sp + k * TAU / 3;
+      px(gx + Math.cos(a - 0.3) * 9, gy + Math.sin(a - 0.3) * 4, M1);
+      px(gx + Math.cos(a) * 9, gy + Math.sin(a) * 4, Math.sin(a) < 0 ? M2 : M3);
+    }
+  } else if (g === 6) {
+    const k = t < 225 ? 1 : 0.7;
+    for (let i = 2; i <= R(13 * k); i++) { const c = i <= 5 ? HOT : i <= 9 ? M3 : M2; px(gx + i, gy, c); px(gx - i, gy, c); }
+    for (let i = 2; i <= R(9 * k); i++) { const c = i <= 4 ? HOT : i <= 7 ? M3 : M2; px(gx, gy + i, c); px(gx, gy - i, c); }
+    for (let i = 1; i <= R(4 * k); i++) { const c = i <= 2 ? M3 : M2; px(gx + i, gy + i, c); px(gx - i, gy - i, c); px(gx + i, gy - i, c); px(gx - i, gy + i, c); }
+    disc(gx, gy, 1, HOT);
+    ring(gx, gy, 5 + ((t - 222) >> 1), 5 + ((t - 222) >> 1), (t & 2) ? M3 : M2, true);
+  }
+}
+function drawSmear(t) {                   // single swing smear frame: thin crescent, fat leading edge
+  if (t < 215 || t >= HS0) return;
+  const hx = P.hx, hy = P.hy, a0 = -1.9, a1 = Math.atan2(P.dy, P.dx);
+  if (a1 <= a0) return;
+  for (let a = a0; a <= a1; a += 0.03) {
+    const rel = (a - a0) / (a1 - a0), th = rel > 0.7 ? 3 : rel > 0.35 ? 2 : 1;
+    if (rel < 0.25 && (R(a * 40) & 1)) continue;
+    for (let k = 0; k < th; k++) {
+      const r = 17 - k;
+      const c = k === 0 ? (rel > 0.7 ? HOT : rel > 0.35 ? M3 : M2) : k === 1 ? (rel > 0.7 ? M3 : M2) : M1;
+      px(hx + Math.cos(a) * r, hy + Math.sin(a) * r, c);
+    }
+  }
+}
+function twinkle(x, y, ph) {
+  switch (ph) {
+    case 0: px(x, y, M2); break;
+    case 1: px(x, y, HOT); px(x - 1, y, M2); px(x + 1, y, M2); px(x, y - 1, M2); px(x, y + 1, M2); break;
+    case 2: px(x, y, HOT); px(x - 1, y, M3); px(x + 1, y, M3); px(x, y - 1, M3); px(x, y + 1, M3);
+            px(x - 2, y, M2); px(x + 2, y, M2); px(x, y - 2, M2); px(x, y + 2, M2); break;
+    case 3: px(x, y, M3); px(x - 1, y, M1); px(x + 1, y, M1); px(x, y - 1, M1); px(x, y + 1, M1); break;
+    default: px(x, y, M1);
+  }
+}
+function drawParticles() {
+  for (let i = 0; i < NP; i++) {
+    const ty = pT[i];
+    if (!ty) continue;
+    const u = pAge[i] / pLife[i], x = pX[i], y = pY[i];
+    switch (ty) {
+      case CONV: {
+        const c = u < 0.3 ? M0 : u < 0.6 ? M1 : u < 0.86 ? M2 : M3;
+        const ddx = x - pLX[i], ddy = y - pLY[i];
+        if (u > 0.3 && ddx * ddx + ddy * ddy < 40) lineB(pLX[i], pLY[i], x, y, c > M0 ? c - 1 : M0);
+        px(x, y, c);
+        if (u > 0.45 && u < 0.7 && (i & 3) === 0) { px(x - 1, y, M1); px(x + 1, y, M1); px(x, y - 1, M1); px(x, y + 1, M1); }
+        break;
+      }
+      case SPARK: {
+        const c = u < 0.12 ? HOT : u < 0.35 ? M3 : u < 0.6 ? M2 : u < 0.82 ? M1 : M0;
+        if (u < 0.6) lineB(pLX[i], pLY[i], x, y, c > M0 ? c - 1 : M0);
+        px(x, y, c);
+        break;
+      }
+      case DEBRIS:
+        if (u > 0.8 && (pAge[i] & 1)) break;
+        px(x, y, pA[i]);
+        if (pB[i] > 0) px(x + 1, y, pA[i] === ST2 ? ST1 : ST0);
+        break;
+      case EMBER:
+        if (u > 0.6 && ((pAge[i] >> 2) & 1)) break;
+        px(x, y, u < 0.25 ? M2 : u < 0.6 ? M1 : M0);
+        break;
+      case TWINK: twinkle(x, y, (u * 5) | 0); break;
+      case MOTE: px(x, y, u < 0.25 ? M3 : u < 0.5 ? M2 : u < 0.75 ? M1 : M0); break;
+    }
+  }
+}
+function drawProjectile(t) {
+  if (t >= HS1 && t < HS1 + 6) {                    // muzzle ring
+    const d = t - HS1;
+    ring(projSX, projSY, 2 + d * 1.4, 2 + d * 1.4, d < 2 ? M3 : d < 4 ? M2 : M1, d > 3);
+  }
+  if (t < HS1 || t >= 240) return;
+  const u = (t - HS1) / 12, x0 = projSX, y0 = projSY;
+  for (let k = 12; k >= 1; k--) {
+    const uk = u - k * 0.02;
+    if (uk < 0) continue;
+    if (k > 7 && ((k + t) & 1)) continue;
+    const x = x0 + (IX - x0) * uk, y = y0 + (IY - y0) * uk;
+    const c = k <= 2 ? HOT : k <= 4 ? M3 : k <= 7 ? M2 : k <= 10 ? M1 : M0;
+    px(x, y, c);
+    if (k <= 5) { px(x, y - 1, k <= 2 ? M3 : M2); px(x, y + 1, k <= 2 ? M3 : M1); }
+  }
+  const x = x0 + (IX - x0) * u, y = y0 + (IY - y0) * u;
+  px(x, y, HOT); px(x - 1, y, HOT); px(x + 1, y, HOT); px(x, y - 1, HOT); px(x, y + 1, HOT);
+  if ((t >> 1) & 1) { px(x - 1, y - 1, M3); px(x + 1, y - 1, M3); px(x - 1, y + 1, M3); px(x + 1, y + 1, M3); px(x + 2, y, M3); }
+  else { px(x + 2, y, M3); px(x - 2, y, M3); px(x, y - 2, M3); px(x, y + 2, M3); px(x + 3, y, M2); }
+}
+function impactLight(t) {
+  const d = t - 240;
+  if (d < 0 || d >= 34) return;
+  const s = 1.7 * (1 - d / 34);
+  light(IX, IY, 20 - d * 0.25, 20 - d * 0.25, s, LIT1);
+  if (d < 5) light(IX, IY, 9, 9, 1.4, LIT2);
+  light(IX - 4, 82, 22 - d * 0.3, 5, s * 0.9, LIT1);
+}
+function crackGlow(t) {
+  const d = t - 240;
+  if (d < 0 || d >= 90) return;
+  const c = d < 8 ? M3 : d < 24 ? M2 : d < 46 ? M1 : M0;
+  for (let k = 0; k < CRACK.length; k += 2) {
+    if (d >= 66 && (((k >> 1) + d) & 1)) continue;
+    px(CRACK[k], CRACK[k + 1], c);
+  }
+}
+function impactFX(t) {
+  const d = t - 240;
+  if (d < 0 || d >= 24) return;
+  if (d < 2) {                                  // 1. core flash
+    disc(IX, IY, 6, HOT); ring(IX, IY, 7, 7, M3, false);
+    for (let i = 7; i <= 16; i++) { const c = i <= 10 ? HOT : i <= 13 ? M3 : M2; px(IX - i, IY, c); px(IX + i, IY, c); }
+    for (let i = 7; i <= 12; i++) { const c = i <= 9 ? HOT : M3; px(IX, IY - i, c); px(IX, IY + i, c); }
+  } else if (d < 4) {
+    disc(IX, IY, 4, HOT); ring(IX, IY, 6, 6, M3, false); ring(IX, IY, 7, 7, M3, false);
+    for (let i = 8; i <= 11; i++) { px(IX - i, IY, M3); px(IX + i, IY, M2); }
+  } else {                                      // 2. expanding shape
+    const u = (d - 4) / 20, r = 7 + 11 * (1 - (1 - u) * (1 - u));
+    const c = d < 8 ? M3 : d < 12 ? M2 : d < 17 ? M1 : M0;
+    ring(IX, IY, r, r, c, d > 13);
+    if (d < 10) ring(IX, IY, r - 1, r - 1, c === M3 ? M2 : M1, false);
+    if (d < 10) { const cr = 3 - (d - 4) * 0.5; if (cr >= 1) disc(IX, IY, cr, d < 6 ? M3 : M2); if (d < 6) px(IX, IY, HOT); }
+  }
+  if (d >= 1 && d < 22) {                       // ground shock ring
+    const u = d / 22, rx = 3 + 22 * (1 - (1 - u) * (1 - u));
+    ring(IX - 2, 82, rx, Math.max(1, rx * 0.2), d < 6 ? M3 : d < 11 ? M2 : d < 16 ? M1 : M0, d > 12);
+  }
+}
+
+// =====================================================================
+//  FRAME COMPOSITION
+// =====================================================================
+function renderScene(t) {
+  camX = 0; camY = 0;
+  if (!RM) {
+    if (t >= 222 && t < 234) { const k = (t - 222) >> 1; camX = SHX[k]; camY = SHY[k]; }
+    else if (t >= 240 && t < 248) { const k = (t - 240) >> 1; camX = IHX[k]; camY = IHY[k]; }
+  }
+  if (!RM && (t === HS0 || t === HS0 + 1)) {          // cast impact frame: white-out silhouette
+    buf.fill(t === HS0 ? HOT : M2);
+    drawCharacter(); finishChar(true, t);
+    const c = t === HS0 ? M2 : HOT, gx = P.gx, gy = P.gy;
+    for (let i = 2; i <= 15; i++) { px(gx + i, gy, c); px(gx - i, gy, c); }
+    for (let i = 2; i <= 10; i++) { px(gx, gy + i, c); px(gx, gy - i, c); }
+    for (let i = 1; i <= 5; i++) { px(gx + i, gy + i, c); px(gx - i, gy - i, c); px(gx + i, gy - i, c); px(gx - i, gy + i, c); }
+    disc(gx, gy, 2, c);
+    return;
+  }
+  for (let y = 0; y < H; y++) {
+    let si = (y - camY + MG) * BW + MG - camX, di = y * W;
+    for (let x = 0; x < W; x++) buf[di++] = bgS[si++];
+  }
+  for (let k = 0; k < TWN; k++) {
+    const ph = (t + k * 37) % 120;
+    if (ph < 10) px(twX[k], twY[k], ph < 3 || ph > 7 ? WS : WH);
+  }
+  light(CX + P.bx * 0.5 - 0.5, GY, 10, 2.2, 2.2, DARK);                   // contact shadow
+  const lv = P.circ;
+  if (lv) light(CX + 1, GY + 1, CIRC_R[lv] + 7, CIRC_R[lv] * 0.28 + 3, CIRC_L[lv], LIT1);
+  if (t >= 222 && t < 236) light(CX + 10, GY, 32, 7, 1.4 * (1 - (t - 222) / 14), LIT1);
+  drawCircle(t);
+  impactLight(t);
+  crackGlow(t);
+  if (t === 222 || t === 223 || (RM && (t === HS0 || t === HS0 + 1))) for (let i = 0; i < W * H; i++) buf[i] = TINT[buf[i]];
+  drawSmear(t);
+  drawCharacter();
+  finishChar(false, t);
+  drawGemFX(t);
+  drawParticles();
+  drawProjectile(t);
+  impactFX(t);
+  for (let y = 0; y < H; y++) {
+    let si = (y - camY + MG) * BW + MG - camX, di = y * W;
+    for (let x = 0; x < W; x++, si++, di++) { const c = fgS[si]; if (c) buf[di] = c; }
+  }
+}
+
+// =====================================================================
+//  RUNTIME
+// =====================================================================
+function step() {
+  T = (T + 1) % L;
+  const t = T;
+  if (t === 0) { rs = RUN_SEED; pCur = 0; }   // identical particle choreography every loop
+  TQ = t - (t % Q);
+  samplePose(TQ);
+  spawns(t);
+  if (!(t >= HS0 && t < HS1)) updateParticles(t);   // hit-stop freezes VFX
+}
+
+const screen = document.getElementById('screen');
+const ctx = screen.getContext('2d', { alpha: false });
+const off = document.createElement('canvas');
+off.width = W; off.height = H;
+const octx = off.getContext('2d');
+const img = octx.createImageData(W, H);
+const img32 = new Uint32Array(img.data.buffer);
+let scale = 1;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  scale = Math.max(1, Math.floor(Math.min(window.innerWidth * dpr / W, window.innerHeight * dpr / H)));
+  screen.width = W * scale; screen.height = H * scale;
+  screen.style.width = (W * scale / dpr) + 'px';
+  screen.style.height = (H * scale / dpr) + 'px';
+  ctx.imageSmoothingEnabled = false;
+}
+function present() {
+  for (let i = 0; i < W * H; i++) img32[i] = PAL[buf[i]];
+  octx.putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, 0, 0, W * scale, H * scale);
+}
+
+const STEP = 1000 / 60;
+let acc = 0, last = -1;
+function frame(now) {
+  if (last < 0) last = now;
+  let dt = now - last; last = now;
+  if (dt > 250) dt = 250;
+  acc += dt;
+  let n = 0;
+  while (acc >= STEP && n < 8) { step(); acc -= STEP; n++; }
+  if (n === 8) acc = 0;
+  renderScene(T);
+  present();
+  requestAnimationFrame(frame);
+}
+
+buildStatic();
+for (let i = 0; i < L * 2; i++) step();   // pre-warm so the first view matches every later loop
+window.addEventListener('resize', resize);
+resize();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
